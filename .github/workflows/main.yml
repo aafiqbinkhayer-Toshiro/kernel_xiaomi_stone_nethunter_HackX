@@ -134,7 +134,13 @@ jobs:
             make -j"$(nproc)" "${MAKE_ARGS[@]}" olddefconfig
           fi
 
-          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image Image.gz dtbs 2>&1 | tee build.log
+          if ! make -j"$(nproc)" "${MAKE_ARGS[@]}" Image Image.gz dtbs 2>&1 | tee build.log; then
+            echo "::error::Build failed. First errors from the log:"
+            grep -nE 'error:|Error [0-9]+|undefined reference|No rule to make target|fatal' build.log | head -30 || true
+            echo "---- rerun with -j1 to get the exact failing step ----"
+            make -j1 "${MAKE_ARGS[@]}" Image 2>&1 | tail -n 40 || true
+            exit 1
+          fi
 
           if grep -q '^CONFIG_MODULES=y' out/.config; then
             make -j"$(nproc)" "${MAKE_ARGS[@]}" modules 2>&1 | tee -a build.log
@@ -232,4 +238,3 @@ jobs:
             Linux ${{ steps.pack.outputs.kver }} — toolchain: ${{ env.TOOLCHAIN }}
             Commit: ${{ github.sha }}
           files: ${{ steps.pack.outputs.zipname }}
-          
