@@ -6,7 +6,7 @@ on:
       defconfig:
         description: "Defconfig name (arch/arm64/configs/ এর ভিতরে, e.g. stone_defconfig বা vendor/xxx_defconfig)"
         required: true
-        default: "stone_defconfig"
+        default: "moonstone_defconfig"
       toolchain:
         description: "Clang toolchain"
         type: choice
@@ -27,7 +27,7 @@ permissions:
   contents: write
 
 env:
-  DEFCONFIG: ${{ inputs.defconfig || 'stone_defconfig' }}
+  DEFCONFIG: ${{ inputs.defconfig || 'moonstone_defconfig' }}
   TOOLCHAIN: ${{ inputs.toolchain || 'neutron' }}
   EXTRA_CONFIGS: ${{ inputs.extra_configs || '' }}
   AOSP_CLANG: clang-r522817
@@ -36,7 +36,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
 
     steps:
