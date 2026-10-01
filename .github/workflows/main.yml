@@ -1,0 +1,235 @@
+name: Build Stone NetHunter Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig name (arch/arm64/configs/ এর ভিতরে, e.g. stone_defconfig বা vendor/xxx_defconfig)"
+        required: true
+        default: "stone_defconfig"
+      toolchain:
+        description: "Clang toolchain"
+        type: choice
+        default: neutron
+        options:
+          - neutron
+          - aosp
+      extra_configs:
+        description: "Extra configs (space separated), e.g. CONFIG_FOO=y CONFIG_BAR=n CONFIG_BAZ=m"
+        required: false
+        default: ""
+      release:
+        description: "GitHub Release বানাবে?"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  DEFCONFIG: ${{ inputs.defconfig || 'stone_defconfig' }}
+  TOOLCHAIN: ${{ inputs.toolchain || 'neutron' }}
+  EXTRA_CONFIGS: ${{ inputs.extra_configs || '' }}
+  AOSP_CLANG: clang-r522817
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 2G
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev cpio lz4 zip unzip xz-utils \
+            python3 curl git ccache dwarves device-tree-compiler \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-stone-${{ env.TOOLCHAIN }}-${{ github.sha }}
+          restore-keys: |
+            ccache-stone-${{ env.TOOLCHAIN }}-
+
+      - name: Setup Neutron Clang
+        if: ${{ env.TOOLCHAIN == 'neutron' }}
+        run: |
+          mkdir -p "$HOME/toolchain" && cd "$HOME/toolchain"
+          curl -fsSLo antman https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman
+          chmod +x antman
+          ./antman -S
+          echo "$HOME/toolchain/bin" >> "$GITHUB_PATH"
+
+      - name: Setup AOSP Clang
+        if: ${{ env.TOOLCHAIN == 'aosp' }}
+        run: |
+          mkdir -p "$HOME/toolchain" && cd "$HOME/toolchain"
+          curl -fsSL "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${AOSP_CLANG}.tar.gz" | tar xz
+          echo "$HOME/toolchain/bin" >> "$GITHUB_PATH"
+
+      - name: Verify defconfig
+        run: |
+          clang --version | head -n1
+          if [ ! -f "arch/arm64/configs/${DEFCONFIG}" ]; then
+            echo "::error::arch/arm64/configs/${DEFCONFIG} পাওয়া যায়নি। নিচের লিস্ট থেকে সঠিকটা দাও:"
+            find arch/arm64/configs -iname '*stone*' -o -iname '*holi*' -o -iname '*sm4375*' -o -iname '*sm6375*' | sort
+            exit 1
+          fi
+
+      - name: Build kernel
+        run: |
+          set -eo pipefail
+          export PATH="/usr/lib/ccache:$PATH"
+          mkdir -p out
+
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            SUBARCH=arm64
+            "CC=ccache clang"
+            HOSTCC=clang
+            HOSTCXX=clang++
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            READELF=llvm-readelf
+            STRIP=llvm-strip
+            KCFLAGS=-Wno-error
+          )
+
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" "${DEFCONFIG}"
+
+          # Optional extra configs (NetHunter tweak ইত্যাদির জন্য)
+          if [ -n "${EXTRA_CONFIGS}" ]; then
+            for opt in ${EXTRA_CONFIGS}; do
+              name="${opt%%=*}"; name="${name#CONFIG_}"
+              val="${opt#*=}"
+              case "$val" in
+                y) ./scripts/config --file out/.config --enable "$name" ;;
+                n) ./scripts/config --file out/.config --disable "$name" ;;
+                m) ./scripts/config --file out/.config --module "$name" ;;
+                *) ./scripts/config --file out/.config --set-val "$name" "$val" ;;
+              esac
+            done
+            make -j"$(nproc)" "${MAKE_ARGS[@]}" olddefconfig
+          fi
+
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image Image.gz dtbs 2>&1 | tee build.log
+
+          if grep -q '^CONFIG_MODULES=y' out/.config; then
+            make -j"$(nproc)" "${MAKE_ARGS[@]}" modules 2>&1 | tee -a build.log
+          fi
+
+          ls -lh out/arch/arm64/boot/
+          ccache -s || true
+
+      - name: Package AnyKernel3 zip
+        id: pack
+        run: |
+          set -e
+          KVER="$(make -s O=out ARCH=arm64 kernelversion)"
+          DATE="$(date +%Y%m%d-%H%M)"
+          ZIPNAME="Stone-NetHunter-${KVER}-${DATE}-${GITHUB_SHA::7}.zip"
+
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md ak3/LICENSE ak3/ramdisk ak3/patch 2>/dev/null || true
+          mkdir -p ak3/ramdisk ak3/patch
+
+          cp out/arch/arm64/boot/Image ak3/Image
+
+          # সব built dtb একসাথে (header v2 ডিভাইসে কাজে লাগবে)
+          DTBS="$(find out/arch/arm64/boot/dts -name '*.dtb' | sort)"
+          if [ -n "$DTBS" ]; then
+            cat $DTBS > ak3/dtb
+            mkdir -p dtbs_out && cp $DTBS dtbs_out/
+          fi
+
+          cat > ak3/anykernel.sh << 'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=Stone NetHunter Kernel by Aafiq (HackX)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=sunstone
+          device.name2=moonstone
+          device.name3=stone
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          dump_boot;
+          write_boot;
+          EOF
+          sed -i 's/^          //' ak3/anykernel.sh
+
+          cd ak3 && zip -r9 "../${ZIPNAME}" . -x '.git*' && cd ..
+          echo "zipname=${ZIPNAME}" >> "$GITHUB_OUTPUT"
+          echo "kver=${KVER}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.zipname }}
+          path: ${{ steps.pack.outputs.zipname }}
+
+      - name: Upload raw boot files (Image, Image.gz, dtbs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: stone-raw-boot-files
+          path: |
+            out/arch/arm64/boot/Image
+            out/arch/arm64/boot/Image.gz
+            dtbs_out/
+          if-no-files-found: warn
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Create GitHub Release
+        if: ${{ inputs.release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: stone-nh-${{ github.run_number }}
+          name: Stone NetHunter ${{ steps.pack.outputs.kver }} (#${{ github.run_number }})
+          body: |
+            Stone NetHunter kernel (sunstone / moonstone)
+            Linux ${{ steps.pack.outputs.kver }} — toolchain: ${{ env.TOOLCHAIN }}
+            Commit: ${{ github.sha }}
+          files: ${{ steps.pack.outputs.zipname }}
+          
