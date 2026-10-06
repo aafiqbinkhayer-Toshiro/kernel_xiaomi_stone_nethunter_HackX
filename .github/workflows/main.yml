@@ -18,6 +18,18 @@ on:
         description: "Extra configs (space separated), e.g. CONFIG_FOO=y CONFIG_BAR=n CONFIG_BAZ=m"
         required: false
         default: ""
+      donor_repo:
+        description: "(Optional) নিজের donor repo URL (এটা আগে চেষ্টা হবে, তারপর built-in donor লিস্ট)"
+        required: false
+        default: ""
+      donor_branch:
+        description: "(Optional) donor repo-র branch"
+        required: false
+        default: ""
+      skip_missing:
+        description: "Missing .i ফাইলের driver disable করে build চালাবে (ওই hardware কাজ করবে না!)"
+        type: boolean
+        default: false
       release:
         description: "GitHub Release বানাবে?"
         type: boolean
@@ -30,6 +42,17 @@ env:
   DEFCONFIG: ${{ inputs.defconfig || 'moonstone_defconfig' }}
   TOOLCHAIN: ${{ inputs.toolchain || 'neutron' }}
   EXTRA_CONFIGS: ${{ inputs.extra_configs || '' }}
+  DONOR_REPO: ${{ inputs.donor_repo || '' }}
+  DONOR_BRANCH: ${{ inputs.donor_branch || '' }}
+  SKIP_MISSING: ${{ inputs.skip_missing || 'false' }}
+  # format: repo_url|branch  (branch ফাঁকা = default branch). এক এক লাইনে এক donor, উপর থেকে নিচে চেষ্টা হবে
+  DEFAULT_DONORS: |
+    https://github.com/MiCode/Xiaomi_Kernel_OpenSource|stone-t-oss
+    https://github.com/MiCode/Xiaomi_Kernel_OpenSource|stone-s-oss
+    https://github.com/Fucking-Projekt/android_kernel_xiaomi_stone|
+    https://github.com/mayuresh2543/kernel_xiaomi_stone_rebase|
+    https://github.com/Jyjyc/eclipse_kernel_xiaomi_stone|
+    https://github.com/gawasvedraj/kernel_xiaomi_stone|
   AOSP_CLANG: clang-r522817
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 2G
@@ -91,6 +114,101 @@ jobs:
             exit 1
           fi
 
+      - name: Check missing .i include files (gitignored)
+        run: |
+          # kernel .gitignore-এ *.i থাকায় #include "xxx.i" ফাইলগুলো প্রায়ই push হয় না
+          scan_missing() {
+            : > missing_i.txt
+            grep -rIl --include='*.c' --include='*.h' -E '#include "[^"]+\.i"' drivers sound techpack net 2>/dev/null | while read -r f; do
+              d="$(dirname "$f")"
+              grep -ohE '#include "[^"]+\.i"' "$f" | sed -E 's/#include "(.*)"/\1/' | while read -r inc; do
+                target="$(realpath -m --relative-to=. "$d/$inc")"
+                [ -f "$target" ] || echo "$target" >> missing_i.txt
+              done
+            done
+            sort -u missing_i.txt -o missing_i.txt
+          }
+
+          scan_missing
+          if [ ! -s missing_i.txt ]; then
+            echo "No missing .i include files."
+            exit 0
+          fi
+
+          echo "::warning::Missing .i files in repo:"
+          cat missing_i.txt
+
+          # 1) donor repo থেকে কপি (user-এর donor_repo আগে, তারপর DEFAULT_DONORS লিস্ট)
+          DONORS=""
+          if [ -n "${DONOR_REPO}" ]; then
+            DONORS="${DONOR_REPO}|${DONOR_BRANCH}"$'\n'
+          fi
+          DONORS="${DONORS}${DEFAULT_DONORS}"
+
+          while IFS='|' read -r url branch; do
+            [ -z "$url" ] && continue
+            echo "=== Donor: $url ${branch:+(branch: $branch)} ==="
+            rm -rf donor
+            # blob ছাড়া clone: শুধু file list আনে, দরকারি ফাইল পরে আলাদা আনে (দ্রুত)
+            if ! git clone --quiet --depth=1 --filter=blob:none --no-checkout ${branch:+-b "$branch"} "$url" donor 2>/dev/null; then
+              echo "clone হয়নি (repo/branch নেই?), পরের donor দেখছি"
+              continue
+            fi
+            git -C donor ls-tree -r --name-only HEAD > donor_files.txt
+            while read -r target; do
+              [ -f "$target" ] && continue
+              if grep -Fxq "$target" donor_files.txt; then
+                src="$target"
+              else
+                src="$(grep -F "/$(basename "$target")" donor_files.txt | grep -E "/$(basename "$target")$" | head -n1 || true)"
+              fi
+              if [ -n "$src" ]; then
+                mkdir -p "$(dirname "$target")"
+                git -C donor show "HEAD:$src" > "$target"
+                echo "RESTORED: $target  <=  $url:$src"
+              fi
+            done < missing_i.txt
+            rm -rf donor donor_files.txt
+            scan_missing
+            if [ ! -s missing_i.txt ]; then
+              echo "সব missing ফাইল donor থেকে পাওয়া গেছে।"
+              exit 0
+            fi
+          done <<< "${DONORS}"
+
+          echo "::warning::এখনও missing:"
+          cat missing_i.txt
+
+          # 2) কোন CONFIG ওই driver build করছে সেটা বের করা
+          find_symbol() {
+            local dir name parent sym
+            dir="$(dirname "$1")"
+            while [ "$dir" != "." ] && [ "$dir" != "/" ]; do
+              parent="$(dirname "$dir")"; name="$(basename "$dir")"
+              sym="$(grep -hE "(^|[[:space:]=])${name}/" "$parent/Makefile" 2>/dev/null | sed -nE 's/.*\$\(CONFIG_([A-Za-z0-9_]+)\).*/\1/p' | head -n1)"
+              if [ -n "$sym" ]; then echo "$sym"; return; fi
+              dir="$parent"
+            done
+          }
+          : > disable_syms.txt
+          while read -r t; do
+            sym="$(find_symbol "$t")"
+            [ -n "$sym" ] && echo "$sym" >> disable_syms.txt
+          done < missing_i.txt
+          sort -u disable_syms.txt -o disable_syms.txt
+          echo "এই CONFIG symbol ওই driver build করছে:"
+          cat disable_syms.txt
+
+          # 3) skip_missing=true হলে ওই driver disable করে build চালানো
+          if [ "${SKIP_MISSING}" = "true" ] && [ -s disable_syms.txt ]; then
+            list=""
+            for s in $(cat disable_syms.txt); do list="$list CONFIG_${s}=n"; done
+            echo "::warning::skip_missing ON, disable হচ্ছে:${list} (ওই driver-এর hardware ডিভাইসে কাজ করবে না!)"
+            echo "DISABLE_CONFIGS=${list}" >> "$GITHUB_ENV"
+          else
+            echo "Fix: (1) git add -f <file> করে push, (2) donor_repo input, অথবা (3) skip_missing=true (hardware কাজ করবে না)"
+          fi
+
       - name: Build kernel
         run: |
           set -eo pipefail
@@ -120,8 +238,9 @@ jobs:
           make -j"$(nproc)" "${MAKE_ARGS[@]}" "${DEFCONFIG}"
 
           # Optional extra configs (NetHunter tweak ইত্যাদির জন্য)
-          if [ -n "${EXTRA_CONFIGS}" ]; then
-            for opt in ${EXTRA_CONFIGS}; do
+          ALL_CONFIGS="$(echo ${EXTRA_CONFIGS} ${DISABLE_CONFIGS:-})"
+          if [ -n "${ALL_CONFIGS}" ]; then
+            for opt in ${ALL_CONFIGS}; do
               name="${opt%%=*}"; name="${name#CONFIG_}"
               val="${opt#*=}"
               case "$val" in
@@ -238,3 +357,4 @@ jobs:
             Linux ${{ steps.pack.outputs.kver }} — toolchain: ${{ env.TOOLCHAIN }}
             Commit: ${{ github.sha }}
           files: ${{ steps.pack.outputs.zipname }}
+          
